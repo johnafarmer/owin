@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "owin",
+  "name": "owin",
+  "version": "0.2.0",
+  "author": "johnafarmer",
+  "license": "MIT",
+  "description": "Per-workspace window layout presets: save the current layout, restore or repair it with one click from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "owin",
+    "description": "Left click restores the favorite preset for the current workspace; right click opens the preset manager.",
+    "category": "Desktop",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

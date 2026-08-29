@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""owin — per-workspace window layout presets for Omarchy/Hyprland.
+
+Capture the current workspace's windows (apps, tile/float state, geometry)
+as a named preset, then restore it later: relaunch missing windows, close
+windows that aren't in the preset, and snap everything back to the saved
+layout. Tiled layouts are rebuilt as a dwindle split tree via preselect,
+then pixel-corrected with exact resizes.
+
+State lives in ~/.local/share/owin/presets.json, keyed by workspace id.
+"""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "owin"
+)
+PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")
+
+SPAWN_TIMEOUT = 15.0
+CLOSE_TIMEOUT = 5.0
+SIZE_TOLERANCE = 8
+
+TERMINAL_CLASSES = {
+    "foot", "footclient", "alacritty", "kitty", "ghostty",
+    "com.mitchellh.ghostty", "org.wezfurlong.wezterm",
+}
+
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "nu"}
+
+# Windows launched (or tagged) by earlier releases carry the old name; keep
+# recognizing them so a rename never orphans a live session.
+MARKER_PREFIXES = ("owin-", "winwalt-")
+
+
+# ---------------------------------------------------------------- hyprctl
+#
+# Reads go through `hyprctl -j`. Writes go through the Lua config runtime
+# (`hyprctl eval` / `hl.dsp.*`) — on Omarchy's Lua-configured Hyprland the
+# classic `hyprctl dispatch <dispatcher> <args>` syntax does not exist.
+
+def hypr_json(cmd):
+    out = subprocess.run(["hyprctl", "-j", cmd], capture_output=True, text=True)
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        sys.exit(f"owin: `hyprctl -j {cmd}` returned no JSON — is Hyprland running?")
+
+
+def hypr_eval(expr, quiet=False):
+    r = subprocess.run(["hyprctl", "eval", expr], capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    ok = r.returncode == 0 and not out.startswith("error")
+    if not ok and not quiet:
+        print(f"  ! hyprctl eval failed: {expr[:100]} -> {out[:150]}", file=sys.stderr)
+    return ok, out
+
+
+def lua_str(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def ldispatch(expr, quiet=False):
+    return hypr_eval(f"hl.dispatch({expr})", quiet=quiet)[0]
+
+
+def focus_window(addr):
+    ldispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
+
+
+def focus_workspace(ws):
+    ldispatch(f'hl.dsp.focus({{ workspace = "{ws}" }})')
+
+
+def close_window(addr):
+    ldispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+
+
+def move_to_workspace(addr, ws):
+    ldispatch(f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{ws}", follow = false }})')
+
+
+def tag_window(addr, tag):
+    ldispatch(f'hl.dsp.window.tag({{ window = "address:{addr}", tag = "+{tag}" }})')
+
+
+def toggle_floating(addr):
+    ldispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "toggle" }})')
+
+
+def resize_exact(addr, w, h):
+    ldispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h} }})')
+
+
+def move_relative(addr, dx, dy):
+    ldispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {dx}, y = {dy}, relative = true }})')
+
+
+_PRESELECT_FORM = [None]  # discovered lazily: "joined", "args", or "none"
+
+
+def preselect(direction):
+    """Arm a dwindle preselect for the next window, if the API supports it."""
+    if _PRESELECT_FORM[0] is None:
+        if ldispatch(f'hl.dsp.layout("preselect {direction}")', quiet=True):
+            _PRESELECT_FORM[0] = "joined"
+            return True
+        if ldispatch(f'hl.dsp.layout("preselect", "{direction}")', quiet=True):
+            _PRESELECT_FORM[0] = "args"
+            return True
+        _PRESELECT_FORM[0] = "none"
+        print("  ! preselect unavailable; relying on resize pass", file=sys.stderr)
+        return False
+    if _PRESELECT_FORM[0] == "joined":
+        return ldispatch(f'hl.dsp.layout("preselect {direction}")')
+    if _PRESELECT_FORM[0] == "args":
+        return ldispatch(f'hl.dsp.layout("preselect", "{direction}")')
+    return False
+
+
+def lua_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return lua_str(v)
+
+
+def exec_cmd(cmd, rules=None):
+    if rules:
+        parts = ", ".join(f"{k} = {lua_value(v)}" for k, v in rules.items())
+        hypr_eval(f"hl.exec_cmd({lua_str(cmd)}, {{ {parts} }})")
+    else:
+        hypr_eval(f"hl.exec_cmd({lua_str(cmd)})")
+
+
+def clients(ws=None):
+    wins = []
+    for w in hypr_json("clients"):
+        if not w.get("mapped", True) or w.get("hidden"):
+            continue
+        if w.get("workspace", {}).get("id", 0) < 0:  # special workspaces
+            continue
+        if ws is not None and w["workspace"]["id"] != ws:
+            continue
+        wins.append(w)
+    return wins
+
+
+def active_workspace():
+    return hypr_json("activeworkspace")["id"]
+
+
+# ---------------------------------------------------------------- /proc
+
+def proc_children(pid):
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(p) for p in f.read().split()]
+    except OSError:
+        return []
+
+
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            parts = f.read().split(b"\0")
+        argv = [p.decode(errors="replace") for p in parts if p]
+        # Processes that rewrite their title (chromium) leave one
+        # space-joined string instead of null-separated argv.
+        if len(argv) == 1 and " " in argv[0]:
+            argv = shlex.split(argv[0])
+        return argv
+    except OSError:
+        return []
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
+def proc_tpgid(pid):
+    """Foreground process group of the process's controlling terminal."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        rest = stat.rsplit(")", 1)[1].split()
+        return int(rest[5])
+    except (OSError, IndexError, ValueError):
+        return -1
+
+
+def effective_class(win):
+    """A window's class for identity purposes.
+
+    Windows owin launched carry their marker as class; resolve them back
+    to the real terminal binary so they compare equal to plain siblings.
+    """
+    cls = win.get("class", "")
+    if cls.startswith(MARKER_PREFIXES):
+        cmd = proc_cmdline(win.get("pid", -1))
+        if cmd:
+            base = os.path.basename(cmd[0])
+            if base in TERMINAL_CLASSES:
+                return base
+    return cls
+
+
+def guess_launch(win):
+    """Return (kind, prog, cwd) for a window: what to run to recreate it."""
+    pid = win.get("pid", -1)
+    cls = win.get("class", "").lower()
+    # Chromium webapp windows (class chrome-<domain>__-<profile>) share the
+    # master browser process, so their cmdline is useless — synthesize the
+    # webapp launch from the class instead.
+    if cls.startswith("chrome-") and "__" in cls:
+        domain = cls[len("chrome-"):].split("__")[0]
+        return "webapp", [f"https://{domain}"], None
+    if cls in TERMINAL_CLASSES or cls.startswith(MARKER_PREFIXES):
+        kids = proc_children(pid)
+        if not kids:
+            return "terminal", None, None
+        child = kids[0]
+        child_cmd = proc_cmdline(child)
+        child_name = os.path.basename(child_cmd[0]).lstrip("-") if child_cmd else ""
+        # An interactive shell is a bare `bash` (flags at most); a shell with
+        # a script argument (`bash ~/.local/bin/maxi`) is a program.
+        is_shell = (child_name in SHELLS
+                    and all(a.startswith("-") for a in child_cmd[1:]))
+        if not is_shell:
+            # The terminal runs the program directly (foot btop, foot nvim).
+            return "terminal", child_cmd or None, proc_cwd(child)
+        fg = proc_tpgid(child)
+        if fg > 0 and fg != child:
+            prog = proc_cmdline(fg)
+            # Login-shell style "-bash" means nothing worth relaunching.
+            if prog and not prog[0].startswith("-"):
+                return "terminal", prog, proc_cwd(fg)
+        return "terminal", None, proc_cwd(child)
+    return "app", proc_cmdline(pid) or None, proc_cwd(pid)
+
+
+# ---------------------------------------------------------------- presets
+
+def load_presets():
+    try:
+        with open(PRESETS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"version": 1, "workspaces": {}}
+
+
+def save_presets(data):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = PRESETS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, PRESETS_FILE)
+
+
+def ws_entry(data, ws):
+    return data["workspaces"].setdefault(str(ws), {"favorite": None, "presets": {}})
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "preset"
+
+
+# ---------------------------------------------------------------- capture
+
+def cmd_capture(args):
+    ws = args.ws if args.ws is not None else active_workspace()
+    wins = clients(ws)
+    if not wins:
+        sys.exit(f"owin: workspace {ws} has no windows to capture")
+
+    slots = []
+    for i, w in enumerate(sorted(wins, key=lambda w: (w["at"][0], w["at"][1]))):
+        kind, prog, cwd = guess_launch(w)
+        marker = f"owin-{ws}-{slug(args.name)}-{i}"
+        # Stamp the live window so later repairs identify it deterministically
+        # even though owin didn't launch it. Tags stick for the window's
+        # lifetime.
+        tag_window(w["address"], marker)
+        ecls = effective_class(w)
+        slots.append({
+            "class": ecls,
+            "initialClass": ecls if ecls != w["class"] else w.get("initialClass", w["class"]),
+            "titleHint": w.get("title", ""),
+            "floating": w["floating"],
+            "rect": [w["at"][0], w["at"][1], w["size"][0], w["size"][1]],
+            "kind": kind,
+            "prog": prog,
+            "cwd": cwd,
+            "marker": marker,
+        })
+
+    data = load_presets()
+    entry = ws_entry(data, ws)
+    entry["presets"][args.name] = {"windows": slots}
+    if not entry["favorite"] or entry["favorite"] not in entry["presets"]:
+        entry["favorite"] = args.name
+    save_presets(data)
+    print(f"captured '{args.name}' on workspace {ws}: {len(slots)} windows "
+          f"({sum(1 for s in slots if s['floating'])} floating)")
+
+
+# ---------------------------------------------------------------- launch
+
+def build_launch(slot):
+    """argv to recreate this window, or None if we don't know how."""
+    cls = slot["class"].lower()
+    marker = slot["marker"]
+    prog = slot["prog"]
+    cwd = slot["cwd"]
+    if slot["kind"] == "terminal":
+        if cls in ("foot", "footclient"):
+            argv = [cls, "-a", marker]
+            if cwd:
+                argv += ["-D", cwd]
+            if prog:
+                argv += prog
+            return argv
+        if cls == "alacritty":
+            argv = ["alacritty", "--class", marker]
+            if cwd:
+                argv += ["--working-directory", cwd]
+            if prog:
+                argv += ["-e"] + prog
+            return argv
+        if cls == "kitty":
+            argv = ["kitty", "--class", marker]
+            if cwd:
+                argv += ["-d", cwd]
+            if prog:
+                argv += prog
+            return argv
+        if "ghostty" in cls:
+            argv = ["ghostty", f"--class={marker}"]
+            if cwd:
+                argv += [f"--working-directory={cwd}"]
+            if prog:
+                argv += ["-e"] + prog
+            return argv
+        # Unknown terminal: relaunch bare and match by class.
+        return [slot["class"]]
+    if slot["kind"] == "webapp" and prog:
+        return ["omarchy-launch-webapp", prog[0]]
+    if prog:
+        argv = list(prog)
+        # Chromium-family browsers take --class, which becomes the Wayland
+        # app-id under ozone, so repair can find them deterministically.
+        if any(b in cls for b in ("chromium", "chrome", "brave", "vivaldi")):
+            argv = [a for a in argv if not a.startswith("--class=")]
+            argv.append(f"--class={marker}")
+        return argv
+    return None
+
+
+def spawn_and_wait(slot, ws, rules=None):
+    argv = build_launch(slot)
+    if argv is None:
+        print(f"  ! can't relaunch {slot['class']} ({slot['titleHint'][:40]}): "
+              "no launch command captured", file=sys.stderr)
+        return None
+    cmdstr = shlex.join(argv)
+    before = {w["address"] for w in clients()}
+    exec_cmd(cmdstr, rules)
+
+    deadline = time.time() + SPAWN_TIMEOUT
+    while time.time() < deadline:
+        for w in clients(ws):
+            if w["address"] in before:
+                continue
+            if w.get("initialClass") == slot["marker"] or w["class"] == slot["marker"]:
+                return w
+            if w["class"] == slot["class"] or w.get("initialClass") == slot["initialClass"]:
+                return w
+        time.sleep(0.15)
+    print(f"  ! timed out waiting for {slot['class']} to spawn", file=sys.stderr)
+    return None
+
+
+# ---------------------------------------------------------------- matching
+
+def center(rect):
+    return (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+
+
+def window_tags(win):
+    tags = win.get("tags") or []
+    return tags if isinstance(tags, list) else [tags]
+
+
+def match_windows(slots, wins):
+    """slot index -> window.
+
+    Deterministic identities first: the owin tag stamped at capture time
+    (survives for the window's lifetime), then the marker app-id given to
+    windows owin launched. Everything else is scored globally — dominated
+    by what is actually running inside the window (live /proc identity),
+    because titles churn and geometry reflows the moment a window closes.
+    """
+    assign = {}
+    used = set()
+    for i, s in enumerate(slots):
+        for w in wins:
+            if w["address"] in used:
+                continue
+            if s["marker"] and (s["marker"] in window_tags(w)
+                                or w.get("initialClass") == s["marker"]
+                                or w["class"] == s["marker"]):
+                assign[i] = w
+                used.add(w["address"])
+                break
+
+    remaining = [i for i in range(len(slots)) if i not in assign]
+    cand = [w for w in wins if w["address"] not in used]
+    if not remaining or not cand:
+        return assign
+    idents = {w["address"]: guess_launch(w) for w in cand}
+
+    eclasses = {w["address"]: effective_class(w) for w in cand}
+    pairs = []
+    for i in remaining:
+        s = slots[i]
+        sprog = s.get("prog") or []
+        for w in cand:
+            if (w["class"] != s["class"] and w.get("initialClass") != s["initialClass"]
+                    and eclasses[w["address"]] != s["class"]):
+                continue
+            _, prog, cwd = idents[w["address"]]
+            prog = prog or []
+            score = 0.0
+            if sprog and prog:
+                # A slot that wants a program only accepts a window running
+                # it: adopting an unrelated window here is how a repair ends
+                # up "restoring" the wrong thing.
+                if prog == sprog:
+                    score += 5000
+                elif os.path.basename(prog[0]) == os.path.basename(sprog[0]):
+                    score += 1500
+                else:
+                    continue
+            elif sprog or prog:
+                continue
+            else:
+                score += 1200
+            if s.get("cwd") and cwd == s["cwd"]:
+                score += 800
+            score += difflib.SequenceMatcher(
+                None, w.get("title", ""), s["titleHint"]).ratio() * 500
+            cx, cy = center(s["rect"])
+            wx, wy = center([*w["at"], *w["size"]])
+            score -= (abs(cx - wx) + abs(cy - wy)) * 0.1
+            pairs.append((score, i, w))
+    pairs.sort(key=lambda p: -p[0])
+    for _, i, w in pairs:
+        if i in assign or w["address"] in used:
+            continue
+        assign[i] = w
+        used.add(w["address"])
+    return assign
+
+
+# ---------------------------------------------------------------- tiling tree
+
+def find_cut(slots, axis):
+    """Split slots along a guillotine cut. axis 0 = vertical, 1 = horizontal."""
+    s = sorted(slots, key=lambda t: t["rect"][axis])
+    max_edge = -1
+    for i in range(len(s) - 1):
+        max_edge = max(max_edge, s[i]["rect"][axis] + s[i]["rect"][2 + axis])
+        next_min = min(t["rect"][axis] for t in s[i + 1:])
+        if max_edge <= next_min:
+            return s[: i + 1], s[i + 1:]
+    return None
+
+
+def build_tree(slots):
+    if len(slots) == 1:
+        return {"leaf": slots[0]}
+    for axis in (0, 1):
+        cut = find_cut(slots, axis)
+        if cut:
+            return {"axis": axis, "a": build_tree(cut[0]), "b": build_tree(cut[1])}
+    # Overlapping rects (shouldn't happen for a real tiled capture): fall back
+    # to an arbitrary balanced split; the resize pass approximates the rest.
+    s = sorted(slots, key=lambda t: (t["rect"][0], t["rect"][1]))
+    mid = len(s) // 2
+    return {"axis": 0, "a": build_tree(s[:mid]), "b": build_tree(s[mid:])}
+
+
+def left_leaf(node):
+    while "leaf" not in node:
+        node = node["a"]
+    return node["leaf"]
+
+
+# ---------------------------------------------------------------- restore
+
+def wait_gone(addresses):
+    deadline = time.time() + CLOSE_TIMEOUT
+    while time.time() < deadline:
+        alive = {w["address"] for w in clients()}
+        if not (addresses & alive):
+            return
+        time.sleep(0.1)
+
+
+def slot_home(slot, cur):
+    """Is the slot's target center inside the window's current box?"""
+    tx, ty = center(slot["rect"])
+    return (cur["at"][0] <= tx <= cur["at"][0] + cur["size"][0]
+            and cur["at"][1] <= ty <= cur["at"][1] + cur["size"][1])
+
+
+def wait_window_state(addr, floating, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for w in clients():
+            if w["address"] == addr:
+                if w["floating"] == floating:
+                    return True
+                break
+        time.sleep(0.08)
+    return False
+
+
+def tiled_settled(slots, assign, ws, tiled_idx):
+    live = {w["address"]: w for w in clients(ws)}
+    for i in tiled_idx:
+        cur = live.get(assign[i]["address"])
+        if not cur or cur["floating"] or not slot_home(slots[i], cur):
+            return False
+    return True
+
+
+def rebuild_tiled(slots, assign, ws, tiled_idx):
+    """Re-tile the preset's windows into the exact dwindle split tree.
+
+    Floating a window lifts it out of the tree without killing it, so the
+    topology can be rebuilt in split order with preselect — the same
+    construction a fresh launch uses — with zero relaunches. Single-window
+    insertion into a reflowed tree can't do this: the node shape the missing
+    window needs may simply not exist anymore.
+    """
+    live = {w["address"]: w for w in clients(ws)}
+    for i in tiled_idx:
+        cur = live.get(assign[i]["address"])
+        if cur and not cur["floating"]:
+            toggle_floating(cur["address"])
+    for i in tiled_idx:
+        wait_window_state(assign[i]["address"], True)
+
+    addr_of = {id(slots[i]): assign[i]["address"] for i in tiled_idx}
+
+    def settle(slot):
+        addr = addr_of[id(slot)]
+        toggle_floating(addr)
+        wait_window_state(addr, False)
+        return addr
+
+    def expand(node, rep_addr):
+        if "leaf" in node:
+            return
+        focus_window(rep_addr)
+        time.sleep(0.05)
+        preselect("r" if node["axis"] == 0 else "d")
+        b_addr = settle(left_leaf(node["b"]))
+        expand(node["a"], rep_addr)
+        expand(node["b"], b_addr)
+
+    tree = build_tree([slots[i] for i in tiled_idx])
+    expand(tree, settle(left_leaf(tree)))
+
+
+def geometry_pass(slots, assign, ws):
+    for attempt in range(3):
+        wins = {w["address"]: w for w in clients(ws)}
+        changed = False
+        for i, slot in enumerate(slots):
+            w = assign.get(i)
+            if not w or w["address"] not in wins:
+                continue
+            cur = wins[w["address"]]
+            x, y, wd, ht = slot["rect"]
+            addr = w["address"]
+            if slot["floating"]:
+                if abs(cur["at"][0] - x) > 2 or abs(cur["at"][1] - y) > 2:
+                    move_relative(addr, x - cur["at"][0], y - cur["at"][1])
+                    changed = True
+                if abs(cur["size"][0] - wd) > 2 or abs(cur["size"][1] - ht) > 2:
+                    resize_exact(addr, wd, ht)
+                    changed = True
+            else:
+                if (abs(cur["size"][0] - wd) > SIZE_TOLERANCE
+                        or abs(cur["size"][1] - ht) > SIZE_TOLERANCE):
+                    resize_exact(addr, wd, ht)
+                    changed = True
+        if not changed:
+            break
+        time.sleep(0.3)
+
+
+def fail(msg, notify=False):
+    if notify:
+        subprocess.run(["omarchy-notification-send", "-g", "󱂬", msg],
+                       capture_output=True)
+    sys.exit(msg)
+
+
+def cmd_restore(args):
+    ws = args.ws if args.ws is not None else active_workspace()
+    data = load_presets()
+    entry = data["workspaces"].get(str(ws))
+    if not entry or not entry["presets"]:
+        fail(f"owin: no presets for workspace {ws}", args.notify)
+    name = args.name or entry["favorite"]
+    if name not in entry["presets"]:
+        fail(f"owin: no preset '{name}' on workspace {ws}", args.notify)
+    slots = entry["presets"][name]["windows"]
+
+    wins = clients(ws)
+    assign = match_windows(slots, wins)
+    matched_addrs = {w["address"] for w in assign.values()}
+    extras = [w for w in wins if w["address"] not in matched_addrs]
+    missing = [i for i in range(len(slots)) if i not in assign]
+
+    if args.dry_run:
+        print(f"preset '{name}' on workspace {ws}:")
+        for i, s in enumerate(slots):
+            state = f"matched {assign[i]['address']}" if i in assign else "MISSING (would launch)"
+            print(f"  [{i}] {s['class']:12} {'float' if s['floating'] else 'tile '} "
+                  f"{s['rect']}  {state}")
+        for e in extras:
+            print(f"  extra: {e['class']} '{e.get('title', '')[:40]}' (would close)")
+        return
+
+    if extras:
+        for e in extras:
+            close_window(e["address"])
+        wait_gone({e["address"] for e in extras})
+
+    if missing and active_workspace() != ws:
+        focus_workspace(ws)
+        time.sleep(0.2)
+
+    # Every missing window spawns floating at its target rect: floats don't
+    # perturb the tiling tree, so spawn order stops mattering and the window
+    # appears where it will end up.
+    for i in missing:
+        s = slots[i]
+        x, y, wd, ht = s["rect"]
+        w = spawn_and_wait(s, ws, rules={"float": True, "move": f"{x} {y}", "size": f"{wd} {ht}"})
+        if w is not None:
+            assign[i] = w
+
+    # Matched windows: right workspace, and floating slots floating.
+    live = {w["address"]: w for w in clients()}
+    for i, w in assign.items():
+        cur = live.get(w["address"])
+        if not cur:
+            continue
+        if cur["workspace"]["id"] != ws:
+            move_to_workspace(w["address"], ws)
+        if slots[i]["floating"] and not cur["floating"]:
+            toggle_floating(w["address"])
+
+    time.sleep(0.2)
+    tiled_idx = [i for i in assign if not slots[i]["floating"]]
+    if tiled_idx and not tiled_settled(slots, assign, ws, tiled_idx):
+        rebuild_tiled(slots, assign, ws, tiled_idx)
+    geometry_pass(slots, assign, ws)
+
+    # Pin identities for the next repair: whatever matched a slot this time
+    # (marker, process identity, or fuzzy) is that slot from now on.
+    for i, w in assign.items():
+        tag_window(w["address"], slots[i]["marker"])
+
+    print(f"restored '{name}' on workspace {ws}: {len(assign)}/{len(slots)} windows placed, "
+          f"{len(extras)} closed, {len(missing)} launched")
+
+
+# ---------------------------------------------------------------- management
+
+def cmd_list(args):
+    ws = args.ws if args.ws is not None else active_workspace()
+    data = load_presets()
+    entry = data["workspaces"].get(str(ws), {"favorite": None, "presets": {}})
+    favorite = entry.get("favorite")
+    if args.json:
+        out = {
+            "workspace": ws,
+            "favorite": favorite,
+            "presets": [
+                {"name": n, "windows": len(p["windows"]),
+                 "floating": sum(1 for s in p["windows"] if s["floating"]),
+                 "favorite": n == favorite}
+                for n, p in entry["presets"].items()
+            ],
+        }
+        print(json.dumps(out))
+        return
+    if not entry["presets"]:
+        print(f"no presets for workspace {ws}")
+        return
+    for n, p in entry["presets"].items():
+        star = "★" if n == favorite else " "
+        print(f"{star} {n}  ({len(p['windows'])} windows)")
+
+
+def cmd_favorite(args):
+    ws = args.ws if args.ws is not None else active_workspace()
+    data = load_presets()
+    entry = ws_entry(data, ws)
+    if args.name not in entry["presets"]:
+        sys.exit(f"owin: no preset '{args.name}' on workspace {ws}")
+    entry["favorite"] = args.name
+    save_presets(data)
+    print(f"favorite for workspace {ws} is now '{args.name}'")
+
+
+def cmd_delete(args):
+    ws = args.ws if args.ws is not None else active_workspace()
+    data = load_presets()
+    entry = ws_entry(data, ws)
+    if args.name not in entry["presets"]:
+        sys.exit(f"owin: no preset '{args.name}' on workspace {ws}")
+    del entry["presets"][args.name]
+    if entry["favorite"] == args.name:
+        entry["favorite"] = next(iter(entry["presets"]), None)
+    save_presets(data)
+    print(f"deleted '{args.name}' from workspace {ws}")
+
+
+# ---------------------------------------------------------------- keybind
+
+BINDINGS_FILE = os.path.expanduser("~/.config/hypr/bindings.lua")
+BIND_MARK = "-- owin favorite-layout keybind"
+
+
+def cmd_bind(args):
+    try:
+        with open(BINDINGS_FILE) as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    current = [l for l in lines if BIND_MARK in l]
+    kept = [l for l in lines if BIND_MARK not in l]
+
+    if args.remove:
+        if not current:
+            print("no owin keybind installed")
+            return
+        write_bindings(kept, lines)
+        print("owin keybind removed")
+        return
+
+    if not args.keys:
+        if current:
+            print(current[0].strip())
+        else:
+            print('no owin keybind installed — set one with: owin bind "SUPER + CTRL + L"')
+        return
+
+    cli = os.path.realpath(__file__)
+    line = (f'o.bind({lua_str(args.keys)}, "Restore favorite layout", '
+            f'{lua_str(f"{cli} restore --notify")}) {BIND_MARK}\n')
+    if kept and not kept[-1].endswith("\n"):
+        kept[-1] += "\n"
+    write_bindings(kept + [line], lines)
+    print(f"bound {args.keys}: restores the focused workspace's favorite preset")
+
+
+def write_bindings(lines, previous):
+    """Write bindings.lua, validate with Hyprland, revert if it objects."""
+    with open(BINDINGS_FILE, "w") as f:
+        f.writelines(lines)
+    subprocess.run(["hyprctl", "reload"], capture_output=True, text=True)
+    errs = subprocess.run(["hyprctl", "configerrors"],
+                          capture_output=True, text=True).stdout.strip()
+    if errs and "no errors" not in errs.lower():
+        with open(BINDINGS_FILE, "w") as f:
+            f.writelines(previous)
+        subprocess.run(["hyprctl", "reload"], capture_output=True, text=True)
+        sys.exit(f"owin: Hyprland rejected the change, reverted bindings.lua:\n{errs}")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="owin", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("capture", help="save the current workspace layout as a preset")
+    c.add_argument("name")
+    c.add_argument("--ws", type=int)
+    c.set_defaults(fn=cmd_capture)
+
+    r = sub.add_parser("restore", help="restore a preset (favorite if no name given)")
+    r.add_argument("name", nargs="?")
+    r.add_argument("--ws", type=int)
+    r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--notify", action="store_true",
+                   help="report errors as desktop notifications")
+    r.set_defaults(fn=cmd_restore)
+
+    l = sub.add_parser("list", help="list presets for a workspace")
+    l.add_argument("--ws", type=int)
+    l.add_argument("--json", action="store_true")
+    l.set_defaults(fn=cmd_list)
+
+    f = sub.add_parser("favorite", help="set the favorite preset for a workspace")
+    f.add_argument("name")
+    f.add_argument("--ws", type=int)
+    f.set_defaults(fn=cmd_favorite)
+
+    d = sub.add_parser("delete", help="delete a preset")
+    d.add_argument("name")
+    d.add_argument("--ws", type=int)
+    d.set_defaults(fn=cmd_delete)
+
+    b = sub.add_parser(
+        "bind",
+        help="keybind that restores the focused workspace's favorite preset")
+    b.add_argument("keys", nargs="?",
+                   help='Hyprland key chord, e.g. "SUPER + CTRL + L"; omit to show the current bind')
+    b.add_argument("--remove", action="store_true", help="remove the keybind")
+    b.set_defaults(fn=cmd_bind)
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
